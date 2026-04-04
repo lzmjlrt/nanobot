@@ -47,7 +47,7 @@ class AgentRunResult:
     stop_reason: str = "completed"
     error: str | None = None
     tool_events: list[dict[str, str]] = field(default_factory=list)
-
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 class AgentRunner:
     """Run a tool-capable LLM loop without product-layer concerns."""
@@ -64,6 +64,7 @@ class AgentRunner:
         error: str | None = None
         stop_reason = "completed"
         tool_events: list[dict[str, str]] = []
+        res_metadata: dict[str, Any] = {}
 
         for iteration in range(spec.max_iterations):
             context = AgentHookContext(iteration=iteration, messages=messages)
@@ -118,13 +119,39 @@ class AgentRunner:
                 tool_events.extend(new_events)
                 context.tool_results = list(results)
                 context.tool_events = list(new_events)
+                from nanobot.agent.tools.ask import AskUserInterrupt
                 if fatal_error is not None:
-                    error = f"Error: {type(fatal_error).__name__}: {fatal_error}"
-                    stop_reason = "tool_error"
-                    context.error = error
-                    context.stop_reason = stop_reason
-                    await hook.after_iteration(context)
-                    break
+                    if isinstance(fatal_error, AskUserInterrupt):
+                        final_content = fatal_error.question
+                        
+                        for tool_call, result in zip(response.tool_calls, results):
+                            if tool_call.name == "ask_user":
+                                continue
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "name": tool_call.name,
+                                "content": result,
+                            })
+                            
+                        stop_reason = "ask_user"
+                        context.final_content = final_content
+                        context.stop_reason = stop_reason
+                        if fatal_error.options:
+                            res_metadata["ask_user_options"] = fatal_error.options
+                        if hook.wants_streaming():
+                            await hook.on_stream_end(context, resuming=False)
+                        await hook.after_iteration(context)
+                        break
+                    else:
+                        error = f"Error: {type(fatal_error).__name__}: {fatal_error}"
+                        stop_reason = "tool_error"
+                        context.error = error
+                        context.stop_reason = stop_reason
+                        if hook.wants_streaming():
+                            await hook.on_stream_end(context, resuming=False)
+                        await hook.after_iteration(context)
+                        break
                 for tool_call, result in zip(response.tool_calls, results):
                     messages.append({
                         "role": "tool",
@@ -172,6 +199,7 @@ class AgentRunner:
             stop_reason=stop_reason,
             error=error,
             tool_events=tool_events,
+        metadata=res_metadata,
         )
 
     async def _execute_tools(
@@ -210,6 +238,15 @@ class AgentRunner:
         except asyncio.CancelledError:
             raise
         except BaseException as exc:
+            from nanobot.agent.tools.ask import AskUserInterrupt
+            if isinstance(exc, AskUserInterrupt):
+                event = {
+                    "name": tool_call.name,
+                    "status": "suspended",
+                    "detail": "Waiting for user input",
+                }
+                return "", event, exc
+
             event = {
                 "name": tool_call.name,
                 "status": "error",

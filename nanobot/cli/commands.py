@@ -838,6 +838,8 @@ def agent(
                                 )
                             continue
                         if msg.metadata.get("_streamed"):
+                            if msg.metadata.get("ask_user_options"):
+                                turn_response.append((msg.content, dict(msg.metadata)))
                             turn_done.set()
                             continue
 
@@ -871,10 +873,39 @@ def agent(
             outbound_task = asyncio.create_task(_consume_outbound())
 
             try:
+                next_ask_options = None
+                next_ask_question = None
                 while True:
                     try:
                         _flush_pending_tty_input()
-                        user_input = await _read_interactive_input_async()
+                        
+                        if next_ask_options:
+                            import questionary
+                            
+                            _restore_terminal()
+                            
+                            choices = list(next_ask_options)
+                            choices.append("Other (type your answer)")
+                            
+                            choice = await questionary.select(
+                                next_ask_question or "Agent asks:",
+                                choices=choices,
+                                instruction="\n↑/↓: navigate, Enter: confirm",
+                                pointer="❯",
+                            ).ask_async()
+                            
+                            if choice == "Other (type your answer)":
+                                user_input = await questionary.text("Please type your answer:").ask_async()
+                            elif choice:
+                                user_input = str(choice)
+                                console.print(f"[dim]You selected: {user_input}[/dim]")
+                            else:
+                                user_input = "User cancelled the prompt."
+                            
+                            next_ask_options = None
+                        else:
+                            user_input = await _read_interactive_input_async()
+                            
                         command = user_input.strip()
                         if not command:
                             continue
@@ -897,6 +928,14 @@ def agent(
                         ))
 
                         await turn_done.wait()
+                        
+                        if turn_response:
+                            last_msg_meta = turn_response[-1][1]
+                            if "ask_user_options" in last_msg_meta:
+                                next_ask_options = last_msg_meta.get("ask_user_options")
+                                next_ask_question = last_msg_meta.get("ask_user_question") or turn_response[-1][0]
+                        else:
+                            next_ask_options = None
 
                         if turn_response:
                             content, meta = turn_response[0]

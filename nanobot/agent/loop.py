@@ -130,8 +130,11 @@ class AgentLoop:
 
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
+        from nanobot.agent.tools.ask import AskUserTool
+
         allowed_dir = self.workspace if self.restrict_to_workspace else None
         extra_read = [BUILTIN_SKILLS_DIR] if allowed_dir else None
+        self.tools.register(AskUserTool())
         self.tools.register(ReadFileTool(workspace=self.workspace, allowed_dir=allowed_dir, extra_allowed_dirs=extra_read))
         for cls in (WriteFileTool, EditFileTool, ListDirTool):
             self.tools.register(cls(workspace=self.workspace, allowed_dir=allowed_dir))
@@ -209,7 +212,7 @@ class AgentLoop:
         channel: str = "cli",
         chat_id: str = "direct",
         message_id: str | None = None,
-    ) -> tuple[str | None, list[str], list[dict]]:
+    ) -> tuple[str | None, list[str], list[dict], dict[str, Any]]:
         """Run the agent iteration loop.
 
         *on_stream*: called with each content delta during streaming.
@@ -271,7 +274,7 @@ class AgentLoop:
             logger.warning("Max iterations ({}) reached", self.max_iterations)
         elif result.stop_reason == "error":
             logger.error("LLM returned error: {}", (result.final_content or "")[:200])
-        return result.final_content, result.tools_used, result.messages
+        return result.final_content, result.tools_used, result.messages, result.metadata
 
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
@@ -386,6 +389,26 @@ class AgentLoop:
         self._running = False
         logger.info("Agent loop stopping")
 
+    def _find_pending_ask_user(self, history: list[dict]) -> str | None:
+        """Find the tool_call_id of an unresolved ask_user tool call in the history."""
+        pending = {}
+        for msg in history:
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                for tc in msg["tool_calls"]:
+                    tc_id = tc.get("id")
+                    if tc_id:
+                        name = tc.get("function", {}).get("name") if "function" in tc else tc.get("name")
+                        pending[tc_id] = name
+            elif msg.get("role") == "tool":
+                tid = msg.get("tool_call_id")
+                if tid in pending:
+                    del pending[tid]
+        
+        for tid, name in pending.items():
+            if name == "ask_user":
+                return tid
+        return None
+
     async def _process_message(
         self,
         msg: InboundMessage,
@@ -411,7 +434,7 @@ class AgentLoop:
                 current_message=msg.content, channel=channel, chat_id=chat_id,
                 current_role=current_role,
             )
-            final_content, _, all_msgs = await self._run_agent_loop(
+            final_content, _, all_msgs, result_meta = await self._run_agent_loop(
                 messages, channel=channel, chat_id=chat_id,
                 message_id=msg.metadata.get("message_id"),
             )
@@ -441,12 +464,31 @@ class AgentLoop:
                 message_tool.start_turn()
 
         history = session.get_history(max_messages=0)
-        initial_messages = self.context.build_messages(
-            history=history,
-            current_message=msg.content,
-            media=msg.media if msg.media else None,
-            channel=msg.channel, chat_id=msg.chat_id,
-        )
+        pending_ask_id = self._find_pending_ask_user(history)
+
+        if pending_ask_id:
+            # We are answering an ask_user tool call!
+            tool_msg = {
+                "role": "tool",
+                "tool_call_id": pending_ask_id,
+                "name": "ask_user",
+                "content": msg.content
+            }
+            history_with_tool = history + [tool_msg]
+            
+            initial_messages = self.context.build_messages(
+                history=history_with_tool,
+                current_message="",  # Just builds the runtime context as a blank user message
+                media=msg.media if msg.media else None,
+                channel=msg.channel, chat_id=msg.chat_id,
+            )
+        else:
+            initial_messages = self.context.build_messages(
+                history=history,
+                current_message=msg.content,
+                media=msg.media if msg.media else None,
+                channel=msg.channel, chat_id=msg.chat_id,
+            )
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
             meta = dict(msg.metadata or {})
@@ -456,7 +498,7 @@ class AgentLoop:
                 channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
             ))
 
-        final_content, _, all_msgs = await self._run_agent_loop(
+        final_content, _, all_msgs, result_meta = await self._run_agent_loop(
             initial_messages,
             on_progress=on_progress or _bus_progress,
             on_stream=on_stream,
@@ -468,6 +510,17 @@ class AgentLoop:
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
 
+        meta = dict(msg.metadata or {})
+        
+        ask_options = result_meta.get("ask_user_options")
+        if ask_options:
+            if msg.channel == "cli":
+                meta["ask_user_options"] = ask_options
+                meta["ask_user_question"] = final_content
+            else:
+                opts_text = "\n".join(f"{i+1}. {o}" for i, o in enumerate(ask_options))
+                final_content += f"\n\n{opts_text}\n{len(ask_options) + 1}. Other (type your answer)"
+
         self._save_turn(session, all_msgs, 1 + len(history))
         self.sessions.save(session)
         self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
@@ -478,7 +531,6 @@ class AgentLoop:
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
 
-        meta = dict(msg.metadata or {})
         if on_stream is not None:
             meta["_streamed"] = True
         return OutboundMessage(
